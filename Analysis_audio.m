@@ -24,6 +24,12 @@
 %% =====================================================================
 close all; clear; clc;
 
+% fsT = 46875;  tT = (0:round(4*fsT))'/fsT;
+% xT  = 0.3*cos(2*pi*260.13*(tT-2) + 0.7) + 0.003*randn(size(tT));
+% [fTst, phiTst, okTst] = demod_freq_phase(xT, 260.4, fsT, 0.1)
+% % ждём: f ≈ 260.13, phi ≈ 0.70, ok = 1
+% % (версия с багом на этом тесте даст ok = 0)
+
 %% 0. НАСТРОЙКИ (правьте под свою установку) ---------------------------
 files = {'channel_0_merged.wav','channel_1_merged.wav', ...
          'channel_2_merged.wav','channel_3_merged.wav'};
@@ -41,7 +47,6 @@ specWinSec = 0.2;              % окно спектр. оценок внутр�
 maxDelaySec = 0.0015;           % ±2 мс (хватает для базы до ~0.6 м)
 
 % --- частоты для графиков АЧХ/ФЧХ и полоса анализа ---
-% (сигнал генератора 100..2000 Гц, поэтому 10 кГц убрано - там шум)
 freqsOfInterest = [110 500 1000 1900];
 fMinAnal = 50;   fMaxAnal = 3000;
 
@@ -325,6 +330,44 @@ noiseRms = nan(1, N);
 u        = [NaN NaN];
 angleDeg = NaN;
 
+%% ДИАГНОСТИКА NaN
+fprintf('\n===== ДИАГНОСТИКА =====\n');
+segDur = (fnE - stE + 1)*hopE/fs;
+fprintf('Сегментов: %d; короче 0.4 с: %d\n', nT, ...
+    sum((fnE-stE+1)*hopE < round(0.4*fs)));
+fprintf('Длительности, с: медиана %.2f, min %.2f, max %.2f\n', ...
+    median(segDur), min(segDur), max(segDur));
+fprintf('Порог тишины: %.1f dBFS\n', 20*log10(10^mean(mu)));
+fprintf('Тонов распознано: %d из %d\n', sum(iT), nT);
+
+% разброс частоты по четвертям каждого сегмента (та же логика, что в блоке 7)
+dF = nan(nT,1);  fA = nan(nT,1);
+for s = 1:nT
+    i1 = (stE(s)-1)*hopE+1;  i2 = min((fnE(s)-1)*hopE+winE, L);
+    n = i2-i1+1;  if n < 64, continue; end
+    fq = nan(1,4);
+    for q = 1:4
+        a = i1+round((q-1)*n/4);  b = i1+round(q*n/4)-1;
+        fq(q) = fft_peak_freq(data(a:b,refCh), fs, fMaxAnal);
+    end
+    dF(s) = max(fq)-min(fq);  fA(s) = median(fq);
+end
+fprintf('Стабильных (<5 Гц разброс): %d, нестабильных: %d\n', ...
+    sum(dF<5), sum(dF>=5));
+fprintf('Пиковые частоты первых сегментов, Гц:\n');
+fprintf('%.0f  ', round(fA(1:min(40,numel(fA)))));
+fprintf('\n(ожидается 100 100 100 100 110 110 ... ; если ~50 — сетевой фон)\n');
+if sum(iT) > 0
+    fprintf('Тонов ниже fLagMax=%g Гц: %d\n', fLagMax, sum(fT(iT)<=fLagMax));
+    fprintf('phT NaN (пара 1): %d из %d\n', sum(isnan(phT(iT,1))), sum(iT));
+end
+fprintf('Не-тонов длиннее 3 с (свипы): %d\n', sum(~isTone & segDur>=3));
+
+figure('Name','Диагностика: огибающая и порог');
+plot((0:nE-1)*hopE/fs, 20*log10(env+eps)); hold on;
+thr = 20*log10(10^mean(mu))*[1 1]; plot([0 L/fs], thr, 'r--');
+xlabel('Время, с'); ylabel('Огибающая, dBFS'); grid on;
+
 %% 8. ГРАФИКИ ПО ТОНАМ ---------------------------------------------------
 if haveTones
     fTv  = fT(iT);   ATv  = AT(iT,:);   THDv = THD(iT,:);
@@ -547,7 +590,7 @@ if haveTones
 
     figure('Name','DOA по тонам (соседние пары, фазовый метод)','Color','w');
     plot(fTv, thT, '.'); grid on; hold on;
-    leg = compose('пара ch%d-ch%d',[0 1 2],[1 2 3]);
+    leg = arrayfun(@(a,b) sprintf('пара ch%d-ch%d', a, b), [0 1 2], [1 2 3], 'UniformOutput', false);
     if ~isempty(thetaTone)
         plot([100 2000], median(thetaTone,'omitnan')*[1 1], 'k-', 'LineWidth', 1.5);
         leg{end+1} = 'медиана';
@@ -600,11 +643,12 @@ else
 end
 
 if ~isempty(tauAdjSec) && max(abs(tauAdjSec)) > 15e-6
+    tauCol = tauAdjSec(:);   % столбец 3x1 — как и разности хода (фикс arrayfun)
     % модель: tau_j = (|p_j - s| - |p_{j+1} - s|)/c   (tau>0: старший раньше)
     idxLo = [1 2 3];   idxHi = [2 3 4];
     costNF = @(sv) sum(((hypot(micPos(idxLo,1)-sv(1), micPos(idxLo,2)-sv(2)) ...
                        - hypot(micPos(idxHi,1)-sv(1), micPos(idxHi,2)-sv(2)))/cSnd ...
-                       - tauAdjSec).^2);
+                       - tauCol).^2);
     xg = -1.5:0.05:1.5;   yg = 0.1:0.05:4;   % диапазон поиска — подстройте под дистанцию
     [Xg, Yg] = meshgrid(xg, yg);
     Cg = arrayfun(@(xx,yy) costNF([xx yy]), Xg, Yg);
@@ -637,9 +681,10 @@ if haveTones
         [~, iB] = min(abs(fTv - fBeam(bi)));
         f0 = fTv(iB);
         z = ATv(iB,:) .* exp(1i*[0, phTv(iB,:)]);     % комплексные амплитуды отн. ch0
+        if any(isnan(z)), continue; end               % защита от неполных данных
         Bp = zeros(size(thScan));
         for ti = 1:numel(thScan)
-            Bp(ti) = abs(sum(z .* exp(-1i*2*pi*f0*xMic*sind(thScan(ti))/cSnd)))^2;
+            Bp(ti) = abs(z * exp(-1i*2*pi*f0*xMic*sind(thScan(ti))/cSnd))^2;
         end
         Bp = 10*log10(Bp/max(Bp) + eps);
         subplot(2,2,bi);
@@ -752,15 +797,16 @@ end
 lagMs = lag / fs * 1000;
 end
 
-function f = fft_peak_freq(x, fs, fmax)
-% Частота главного пика спектра: окно Ханна, паддинг x4, парабола по log|X|.
+function f = fft_peak_freq(x, fs, fmax, fmin)
+if nargin < 4, fmin = 70; end          % ниже — сетевой фон 50 Гц
 x = x(:);
 n = numel(x);
 if n < 16, f = NaN; return; end
 nfft = 2^nextpow2(4*n);
 X = abs(fft(x .* hann(n), nfft));
-hi = max(3, min(round(fmax/fs*nfft), floor(nfft/2)));
-[~, ip] = max(X(2:hi));   ip = ip + 1;
+lo = max(2, round(fmin/fs*nfft));      % <-- было 2, старт с бина 2
+hi = max(lo+2, min(round(fmax/fs*nfft), floor(nfft/2)));
+[~, ip] = max(X(lo:hi));   ip = ip + lo - 1;
 if ip <= 1 || ip >= numel(X), f = NaN; return; end
 a = log(X(ip-1)+eps);  b = log(X(ip)+eps);  c = log(X(ip+1)+eps);
 den = a - 2*b + c;
@@ -772,28 +818,44 @@ end
 end
 
 function [f, phi, ok] = demod_freq_phase(x, f0, fs, trimFrac)
-% Уточнение частоты тона и его фазы в ЦЕНТРЕ сегмента:
-% демодуляция на f0, unwrap фазы, линейная аппроксимация.
-% phi — фаза основной гармоники в центре сегмента (рад).
+% Уточнение частоты тона и его фазы в ЦЕНТРЕ сегмента.
+% Сигнал перемножается с exp(-i*2*pi*f0*tc) на ОБЩЕЙ шкале времени tc
+% (центр сегмента = 0) — одной и той же для всех окон. Остаётся медленная
+% компонента на разности d = f_ист - f0 (зеркальная ~2*f0 подавляется
+% окном). Фазы в центрах 8 окон дают d (однозначно при |d| < 1/(2*dt)
+% ~ 1.2 Гц), их разброс — критерий стабильности тона.
 x = x(:);
 n = numel(x);
 i1 = round(trimFrac*n) + 1;
 i2 = n - round(trimFrac*n);
-if i2 - i1 + 1 < 64, f = f0; phi = NaN; ok = false; return; end
-t  = ((i1:i2)' - 1) / fs;
-tc = t - mean(t);
-z  = x(i1:i2) .* exp(-1i*2*pi*f0*tc);
-p  = unwrap(angle(z));
-pf = polyfit(tc, p, 1);
-df = pf(1) / (2*pi);
-rr = rms(p - polyval(pf, tc));
-ok = ~any(isnan(pf)) && abs(df) < 5 && rr < 0.5;
-if ok
-    f   = f0 + df;
-    phi = pf(2);
-else
-    f = f0;  phi = NaN;
+m = i2 - i1 + 1;
+if m < 64, f = f0; phi = NaN; ok = false; return; end
+xc = x(i1:i2);
+tc = ((0:m-1)')/fs;
+tc = tc - mean(tc);                          % центр сегмента = 0
+
+% --- фаза 1-й гармоники в центре сегмента ---
+w  = hann(m);
+X0 = sum(xc .* w .* exp(-1i*2*pi*f0*tc));
+phi = angle(X0);
+
+% --- частота и контроль качества по 8 окнам ---
+Nc = 8;
+q  = floor(m/Nc);
+if q < 32, f = f0; ok = false; return; end
+pq = nan(1,Nc);
+for kq = 1:Nc
+    a = (kq-1)*q + 1;
+    b = min(kq*q, m);
+    pq(kq) = angle(sum(xc(a:b) .* hann(b-a+1) .* ...
+                        exp(-1i*2*pi*f0*tc(a:b))));
 end
+dt  = q/fs;                                  % шаг между центрами окон, с
+dp  = wrap_pi(diff(pq));                     % приращение фазы за dt
+df  = mean(dp)/(2*pi*dt);                    % оценка d = f_ист - f0, Гц
+f   = f0 + df;
+dev = wrap_pi(dp - 2*pi*df*dt);              % остаточный разброс, рад
+ok  = ~any(isnan(dev)) && max(abs(dev)) < 0.6;
 end
 
 function a = wrap_pi(x)
