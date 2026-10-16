@@ -29,7 +29,7 @@ specWinSec = 0.2;              % окно спектральных оценок,
 maxDelaySec = 0.0018;          % окно поиска задержки, +-1.8 мс
                                % (размах решётки 0.66 м -> крайние до 1.92 мс)
 
-freqsOfInterest = [110 500 1000 1900];
+freqsOfInterest = [100 500 1000 1900];
 fMinAnal = 50;   fMaxAnal = 3000;
 
 % --- геометрия: 4 микрофона в ряд по X, шаг dMic, центр (0,0) ---
@@ -231,6 +231,9 @@ for s = 1:nT
     end
     if any(isnan(fq)), continue; end
     isTone(s) = (max(fq) - min(fq)) < 5;  % иначе — свип
+    if isTone(s) && (median(fq) < 75 || median(fq) > 2050)
+        isTone(s) = false;   % розовый шум: пик спектра у нижней границы
+    end
     if ~isTone(s), continue; end
 
     f0 = fft_peak_freq(seg(:,refCh), fs, fMaxAnal);
@@ -456,15 +459,14 @@ for ch = 1:N
 end
 
 %% 9. ШУМ В ПАУЗАХ ---------------------------------------------------------
+% Паузы ищем по огибающей: 20%% самых тихих окон + запас 3 дБ
+sEnv = sort(env);
+qLow = sEnv(max(1, round(0.2*numel(sEnv))));
+envM = env <= 1.4*qLow;
 noiseMask = false(L,1);
-for s = 1:numel(stE)
-    a = (fnE(s)-1)*hopE + winE + round(0.3*fs);
-    if s < numel(stE)
-        b = (stE(s+1)-1)*hopE - round(0.05*fs);
-    else
-        b = L;
-    end
-    a = max(a,1);  b = min(b,L);
+for e = find(envM)
+    a = max(1, (e-1)*hopE + 1);
+    b = min(L, (e-1)*hopE + winE);
     if b > a, noiseMask(a:b) = true; end
 end
 noiseRms = nan(1, N);
@@ -481,6 +483,43 @@ if nnz(noiseMask) >= round(2*fs)
     noiseRms = sqrt(mean(data(noiseMask,:).^2, 1));
 else
     warning('Паузы не найдены — оценка шума пропущена');
+end
+
+%% 9.5 ИМПУЛЬСЫ СТАРТ/СТОП: детекция и TDOA
+wS = round(0.005*fs);   hS = wS;               % окно/шаг 5 мс
+nS = floor((L-wS)/hS) + 1;
+eS = zeros(nS,1);
+for e = 1:nS
+    idx = (e-1)*hS + (0:wS-1) + 1;
+    eS(e) = sqrt(mean(data(idx,refCh).^2));
+end
+kL = 60;                                        % окно сравнения 300 мс
+eL = zeros(nS,1);
+for e = 1:nS
+    a = max(1, e-kL/2);  b = min(nS, e+kL/2);
+    eL(e) = sqrt(mean(eS(a:b).^2));
+end
+cand = find(eS > 4*eL & eS > 4*median(eS));     % изолированный короткий всплеск
+impC = [];
+for k = 1:numel(cand)                           % слияние соседних окон
+    if isempty(impC) || cand(k) - impC(end) > 6
+        impC(end+1) = cand(k);   %#ok<AGROW>
+    end
+end
+tauImpMs = nan(numel(impC), 3);
+for k = 1:numel(impC)
+    p = (impC(k)-1)*hS + round(wS/2);
+    a = max(1, p - round(0.010*fs));
+    b = min(L, p + round(0.030*fs));            % прямой путь + ранние отражения
+    tauImpMs(k,:) = [gccphat_lag(data(a:b,1), data(a:b,2), fs, maxLag), ...
+                     gccphat_lag(data(a:b,2), data(a:b,3), fs, maxLag), ...
+                     gccphat_lag(data(a:b,3), data(a:b,4), fs, maxLag)];
+    fprintf('Импульс #%d: t = %7.2f с; соседние задержки: %+6.1f %+6.1f %+6.1f мкс\n', ...
+        k, p/fs, tauImpMs(k,1)*1e3, tauImpMs(k,2)*1e3, tauImpMs(k,3)*1e3);
+end
+if ~isempty(impC)
+    fprintf('Импульсный TDOA (медиана): %s мкс\n', ...
+        sprintf('%+6.1f ', median(tauImpMs,1,'omitnan')*1e3));
 end
 
 %% 10-11. DOA ЛИНЕЙНОЙ РЕШЁТКИ, БЛИЖНЕЕ ПОЛЕ, ДН, СОХРАНЕНИЕ --------------
